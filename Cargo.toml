@@ -1,0 +1,13 @@
+[package]
+name = "epoll-rs"
+version = "0.1.0"
+authors = ["Max Blachman <blachmanmax@gmail.com>"]
+edition = "2018"
+
+[lib]
+name="epoll_rs"
+path="src/lib.rs"
+
+[dependencies]
+libc = {version ="^0.2", features = ["extra_traits"]}
+bitflags = "^1.2.1"
