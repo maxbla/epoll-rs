@@ -1,40 +1,58 @@
+//! A rusty wrapper for the epoll syscall that is very difficult to misuse.
+//! 
+//! Files added to the epoll instance must live as long as it
+//! ```compile_fail
+//! use epoll_rs::{Epoll, Opts, new_epoll};
+//! let epoll = new_epoll!().unwrap();
+//! let token = {
+//!     let f = std::fs::File::open("~").unwrap();
+//!     epoll.add_file(&f, Opts::IN).unwrap()
+//! }; // Error f dropped while still borrowed
+//! ```
+//!
+//! Tokens returned from one epoll instance cannot be used with another instance
+//! ```compile_fail
+//! use epoll_rs::{Epoll, Opts, new_epoll};
+//! use std::io;
+//! let mut epoll1 = new_epoll!()?;
+//! let mut epoll2 = new_epoll!()?;
+//! let f = std::fs::File::open("/").unwrap();
+//! let token1 = (&mut epoll1).add_file(&f, Opts::IN).unwrap();
+//! let res = epoll2.remove(token1); // <- expected closure, found different closure (not a great error message)
+//! ```
+
 use bitflags::bitflags;
 use libc::epoll_event;
-use std::{cell::UnsafeCell, io, time::Duration};
 use std::{convert::TryInto, os::unix::io::AsRawFd};
+use std::{io, time::Duration};
 
-// TODO: make this crate no_std and use a pure rust syscall implementation
+mod sync_unsafe_cell;
 
-// Like UnsafeCell, only implements Sync
-// This would allow concurrent modification by multiple threads, but that causes UB
-// This is only used to work around a bug on old versions of Linux
-struct SyncUnsafeCell<T> {
-    inner: UnsafeCell<T>,
-}
-
-unsafe impl<T> Sync for SyncUnsafeCell<T> {}
-
-impl<T> SyncUnsafeCell<T> {
-    fn get(&self) -> *mut T {
-        self.inner.get()
-    }
-}
-
-static EMPTY_EVENT: SyncUnsafeCell<epoll_event> = SyncUnsafeCell {
-    inner: UnsafeCell::new(epoll_event {
+static EMPTY_EVENT: sync_unsafe_cell::SyncUnsafeCell<epoll_event> =
+    sync_unsafe_cell::SyncUnsafeCell::new(epoll_event {
         events: Opts::empty().bits(),
         u64: 0,
-    }),
-};
+    });
 
 /// Opaque type used to refer to single files registered with an epoll instance
 ///
 /// Using a Token with an `Epoll` instance that it did not come from
-/// (i.e. with epoll.add_file) is a bug in your program and may result in
-/// `io::Errors`, but may also affect seemingly random files
+/// (i.e. with epoll.add_file) is a bug in your program. It will result in
+/// `io::Error(ErrorKind::InvalidArgument)` in debug mode and in release mode 
+/// doing so causes 
 #[derive(Debug, PartialEq, Hash)]
-pub struct Token {
+pub struct Token <'a, T: FnOnce()> {
     fd: libc::c_int,
+    phantom: std::marker::PhantomData<&'a Epoll<T>>,
+}
+
+impl<'a, T: FnOnce()> Token<'a, T> {
+    fn new(fd: libc::c_int) -> Self {
+        Token {
+            fd,
+            phantom: std::marker::PhantomData,
+        }
+    }
 }
 
 bitflags! {
@@ -77,18 +95,22 @@ macro_rules! then_errno {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct EpollEvent {
     pub events: Opts,
-    fd: u64,
+    fd: libc::c_int,
 }
 
-impl From<EpollEvent> for Token {
-    fn from(event: EpollEvent) -> Self {
-        Token {
-            fd: event.fd as i32,
-        }
+impl<T:FnOnce()> PartialEq<Token<'_, T>> for EpollEvent {
+    fn eq(&self, other: &Token<T>) -> bool {
+        other.fd == self.fd
     }
 }
 
-impl Drop for Epoll {
+impl<T:FnOnce()> PartialEq<EpollEvent> for Token<'_, T> {
+    fn eq(&self, other: &EpollEvent) -> bool {
+        other.fd == self.fd
+    }
+}
+
+impl<T: FnOnce()> Drop for Epoll<T> {
     fn drop(&mut self) {
         unsafe { libc::close(self.epoll_fd) };
     }
@@ -96,38 +118,51 @@ impl Drop for Epoll {
 
 /// Wrapper type around an epoll fd, like the standard library's `File` is a
 /// wrapper around normal fds.
-#[derive(Debug, PartialEq, Hash)]
-pub struct Epoll {
-    epoll_fd: i32,
+#[derive(Debug)]
+pub struct Epoll<T:FnOnce()> {
+    epoll_fd: libc::c_int,
+    phantom: std::marker::PhantomData<T>,
     //TODO: replace with array when const generics are stabilized
     buf: Vec<libc::epoll_event>,
 }
 
-impl Epoll {
-    /// Like new, but allocates a buffer of size `capacity`
-    /// for storing epoll events in Epoll::wait()
-    fn with_capacity(capacity: usize) -> io::Result<Self> {
-        //TODO: make thie function pub (gated on min-const-generics)
+#[doc(hidden)]
+pub mod private {
+    //! API consumers shouldn't use anything in here directly
+    use std::io;
+    use super::Epoll;
+
+    pub fn epoll_with_capacity<T:FnOnce()>(_t:T, capacity: usize) -> io::Result<Epoll<T>> {
         let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         then_errno!(fd == -1);
         Ok(Epoll {
             epoll_fd: fd,
+            phantom: std::marker::PhantomData,
             buf: vec![libc::epoll_event { events: 0, u64: 0 }; capacity],
         })
     }
+
+    pub fn epoll_new<T:FnOnce()>(t:T) -> io::Result<Epoll<T>> {
+        epoll_with_capacity(t, 20)
+    }
+}
+
+#[macro_export]
+macro_rules! new_epoll {
+    () => {{
+        $crate::private::epoll_new(||{})
+    }};
+}
+
+impl<T: FnOnce()> Epoll<T> {
 
     /// Returns the capacity of the internal buffer storing epoll events
     pub fn capacity(&self) -> usize {
         self.buf.len()
     }
 
-    /// Open a new epoll fd, but don't add any files to it
-    pub fn new() -> io::Result<Self> {
-        Self::with_capacity(20)
-    }
-
-    fn add_fd(&mut self, fd: i32, opts: Opts) -> io::Result<Token> {
-        let token = Token { fd };
+    fn add_fd<'a>(self: &'_ &'a mut Self, fd: i32, opts: Opts) -> io::Result<Token<'a, T>> {
+        let token = Token::new(fd);
         let mut event = epoll_event {
             events: opts.bits(),
             u64: token.fd.try_into().unwrap(),
@@ -144,9 +179,9 @@ impl Epoll {
     ///
     /// The token return type can be ignored if you don't need to distinguish
     /// between files (e.g. you only have one file added)
-    pub fn add<F>(&mut self, file: &F, opts: Opts) -> io::Result<Token>
+    pub fn add_file<'a, 'b:'a, F>(self:& &'a mut Self, file: &'b F, opts: Opts) -> io::Result<Token<'a, T>>
     where
-        F: AsRawFd,
+        F: 'a + AsRawFd,
     {
         self.add_fd(file.as_raw_fd(), opts)
     }
@@ -155,7 +190,7 @@ impl Epoll {
     ///
     /// Consumes the token, since the file it is associated with is no longer
     /// in this epoll instance
-    pub fn remove(&mut self, token: Token) -> io::Result<()> {
+    pub fn remove<'a>(&'a mut self, token: Token<'a, T>) -> io::Result<()> {
         let res = unsafe {
             libc::epoll_ctl(
                 self.epoll_fd,
@@ -169,7 +204,7 @@ impl Epoll {
     }
 
     /// Change the opts of a previously added file-like struct
-    pub fn modify(&mut self, token: &Token, opts: Opts) -> io::Result<()> {
+    pub fn modify(&mut self, token: &Token<T>, opts: Opts) -> io::Result<()> {
         let mut event = epoll_event {
             events: opts.bits(),
             u64: token.fd.try_into().unwrap(),
@@ -239,9 +274,29 @@ impl Epoll {
     }
 }
 
+    // Use a doctest because those are allowed to fail at compile time
+    /// ```compile_fail
+    /// # use epoll_rs::*;
+    /// # use std::*;
+    /// # use time::*;
+    /// # use fs::*;
+    /// let file = File::open("/").unwrap();
+    /// let token = {
+    ///     let mut epoll = new_epoll!().unwrap();
+    ///     let mut epoll = &mut epoll;
+    ///     let token = epoll.add_file(&file, Opts::OUT).unwrap();
+    ///     epoll.wait_timeout(Duration::from_millis(10)).unwrap();
+    ///     token
+    /// };
+    /// ```
+    #[doc(hidden)]
+    #[allow(unused)] // this test is actually a doctest
+    fn test_token_lifetime() {
+    }
+
 #[cfg(test)]
 mod test {
-    use crate::{Epoll, EpollEvent, Opts};
+    use crate::{EpollEvent, Opts, new_epoll};
     use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::{
         fs::File,
@@ -270,14 +325,14 @@ mod test {
     fn test_epoll_wait_read() {
         const MESSAGE: &[u8; 6] = b"abc123";
         fn wait_then_read(mut file: File) -> Instant {
-            let mut epoll = Epoll::new().unwrap();
-            let _tok = epoll.add(&file, Opts::IN).unwrap();
+            let mut epoll = new_epoll!().unwrap();
+            let _tok = (&mut epoll).add_file(&file, Opts::IN).unwrap();
             let events = epoll.wait().unwrap();
             assert_eq!(
                 events[0],
                 EpollEvent {
                     events: Opts::IN,
-                    fd: file.as_raw_fd() as u64
+                    fd: file.as_raw_fd()
                 }
             );
             let read_instant = Instant::now();
@@ -301,8 +356,8 @@ mod test {
         const MESSAGE_1: &[u8; 6] = b"abc123";
         const MESSAGE_2: &[u8; 6] = b"def456";
         fn wait_then_read(mut file: File) -> Instant {
-            let mut epoll = Epoll::new().unwrap();
-            let _tok = epoll.add(&file, Opts::IN).unwrap();
+            let mut epoll = new_epoll!().unwrap();
+            let _tok = (&mut epoll).add_file(&file, Opts::IN).unwrap();
             let event1 = {
                 let events = epoll.wait_limit(1).unwrap();
                 events[0]
@@ -312,14 +367,14 @@ mod test {
                 event1,
                 EpollEvent {
                     events: Opts::IN,
-                    fd: file.as_raw_fd() as u64
+                    fd: file.as_raw_fd()
                 }
             );
             assert_eq!(
                 events2[0],
                 EpollEvent {
                     events: Opts::IN,
-                    fd: file.as_raw_fd() as u64
+                    fd: file.as_raw_fd()
                 }
             );
             let read_instant = Instant::now();
@@ -342,8 +397,9 @@ mod test {
     #[test]
     fn test_timeout() {
         let (read, write) = open_pipe().unwrap();
-        let mut epoll = Epoll::new().unwrap();
-        epoll.add(&read, Opts::IN).unwrap();
+        let mut epoll = new_epoll!().unwrap();
+        let epoll = &mut epoll;
+        epoll.add_file(&read, Opts::IN).unwrap();
         for &wait_ms in [0_u64, 30, 100].iter() {
             let start_wait = Instant::now();
             let _events = epoll.wait_timeout(Duration::from_millis(wait_ms)).unwrap();
@@ -367,9 +423,9 @@ mod test {
     fn test_hup() {
         let (mut epoll, read) = {
             let (read, write) = open_pipe().unwrap();
-            let mut epoll = Epoll::new().unwrap();
+            let mut epoll = new_epoll!().unwrap();
             // no need to epoll.add(Opts::HUP) - it is added by default
-            epoll.add(&read, Opts::RDHUP).unwrap();
+            (&mut epoll).add_file(&read, Opts::RDHUP).unwrap();
             drop(write);
             (epoll, read)
         };
@@ -379,7 +435,7 @@ mod test {
             buf[0],
             EpollEvent {
                 events: Opts::HUP,
-                fd: read.as_raw_fd() as u64
+                fd: read.as_raw_fd()
             }
         )
     }
