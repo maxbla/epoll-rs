@@ -30,7 +30,7 @@
 use bitflags::bitflags;
 use libc::epoll_event;
 use std::os::unix::{self, io::AsRawFd};
-use std::{convert::TryInto, io, net, time::Duration};
+use std::{convert::TryInto, io, marker::PhantomData, net, time::Duration};
 
 mod sync_unsafe_cell;
 
@@ -44,14 +44,14 @@ static EMPTY_EVENT: sync_unsafe_cell::SyncUnsafeCell<epoll_event> =
 #[derive(Debug, PartialEq, Hash)]
 pub struct Token<'a, T: FnOnce()> {
     fd: libc::c_int,
-    phantom: std::marker::PhantomData<&'a Epoll<T>>,
+    phantom: PhantomData<&'a Epoll<T>>,
 }
 
 impl<T: FnOnce()> Token<'_, T> {
     fn new(fd: libc::c_int) -> Self {
         Token {
             fd,
-            phantom: std::marker::PhantomData,
+            phantom: PhantomData,
         }
     }
 }
@@ -82,6 +82,7 @@ bitflags! {
     }
 }
 
+/// if condition is true, return errno
 macro_rules! then_errno {
     ($e:expr) => {
         if $e {
@@ -139,7 +140,7 @@ impl<T: FnOnce()> Drop for Epoll<T> {
 #[derive(Debug)]
 pub struct Epoll<T: FnOnce()> {
     epoll_fd: libc::c_int,
-    phantom: std::marker::PhantomData<T>,
+    phantom: PhantomData<T>,
     //TODO: replace with array when const generics are stabilized
     buf: Vec<libc::epoll_event>,
 }
@@ -148,14 +149,14 @@ pub struct Epoll<T: FnOnce()> {
 pub mod private {
     //! API consumers shouldn't use anything in here directly
     use super::Epoll;
-    use std::io;
+    use std::{io, marker::PhantomData};
 
     pub fn epoll_with_capacity<T: FnOnce()>(_t: T, capacity: usize) -> io::Result<Epoll<T>> {
         let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         then_errno!(fd == -1);
         Ok(Epoll {
             epoll_fd: fd,
-            phantom: std::marker::PhantomData,
+            phantom: PhantomData,
             buf: vec![libc::epoll_event { events: 0, u64: 0 }; capacity],
         })
     }
@@ -212,9 +213,9 @@ impl<T: FnOnce()> Epoll<T> {
     ///
     /// ## Safety
     /// `fd` must refer to a currently open file that does not outlive the
-    /// Epoll instance. If `fd` refers to a closed file before this Epoll
-    /// instance is dropped, later use of the token this method returns may
-    /// modify a different file, since POSIX requires that `RawFd`s are reused.
+    /// Epoll instance. If `fd` refers to a file that is dropped before this Epoll
+    /// instance, later use of the returned `Token` may modify a different file,
+    /// since POSIX requires that file descriptors (`RawFd`s) are reused.
     pub unsafe fn add_raw_fd(self: &&mut Self, fd: unix::io::RawFd, opts: Opts) -> io::Result<Token<T>> {
         let token = Token::new(fd);
         let mut event = epoll_event {
@@ -231,14 +232,11 @@ impl<T: FnOnce()> Epoll<T> {
     ///
     /// The returned token can be ignored if you don't need to distinguish
     /// between files later.
-    pub fn add<'a, 'b: 'a, F>(
+    pub fn add<'a, 'b: 'a, F: OwnedRawFd>(
         self: &&'a mut Self,
         file: &'b F,
         opts: Opts,
-    ) -> io::Result<Token<'a, T>>
-    where
-        F: OwnedRawFd,
-    {
+    ) -> io::Result<Token<'a, T>> {
         // Safety: lifetime bounds on function declaration keep this safe
         unsafe { self.add_raw_fd(file.as_raw_fd(), opts) }
     }
@@ -279,7 +277,7 @@ impl<T: FnOnce()> Epoll<T> {
         Ok(())
     }
 
-    /// Wait indefinetly, or until at least one event occurs
+    /// Wait indefinetly for at least one event to occur
     pub fn wait(&mut self) -> io::Result<&[EpollEvent]> {
         self.wait_maybe_timeout(None, None)
     }
@@ -314,7 +312,7 @@ impl<T: FnOnce()> Epoll<T> {
         timeout: Option<Duration>,
         lim: Option<usize>,
     ) -> io::Result<&[EpollEvent]> {
-        let timeout_ms = timeout.map(|t| t.as_millis() as i32).unwrap_or(-1);
+        let timeout_ms = timeout.map(|t| t.as_millis().try_into().unwrap_or(i32::MAX)).unwrap_or(-1);
         let buf_size = lim
             .map(|lim| self.buf.len().min(lim))
             .unwrap_or(self.buf.len());
@@ -334,25 +332,6 @@ impl<T: FnOnce()> Epoll<T> {
     }
 }
 
-// Use a doctest because those are allowed to fail at compile time
-/// ```compile_fail
-/// # use epoll_rs::*;
-/// # use std::*;
-/// # use time::*;
-/// # use fs::*;
-/// let file = File::open("/").unwrap();
-/// let token = {
-///     let mut epoll = new_epoll!().unwrap();
-///     let mut epoll = &mut epoll;
-///     let token = epoll.add_file(&file, Opts::OUT).unwrap();
-///     epoll.wait_timeout(Duration::from_millis(10)).unwrap();
-///     token
-/// };
-/// ```
-#[doc(hidden)]
-#[allow(unused)] // this test is actually a doctest
-fn test_token_lifetime() {}
-
 #[cfg(test)]
 mod test {
     use crate::{new_epoll, EpollEvent, Opts};
@@ -363,6 +342,25 @@ mod test {
         thread,
         time::{Duration, Instant},
     };
+
+    // Use a doctest because those are allowed to fail at compile time
+    /// ```compile_fail
+    /// # use epoll_rs::*;
+    /// # use std::*;
+    /// # use time::*;
+    /// # use fs::*;
+    /// let file = File::open("/").unwrap();
+    /// let token = {
+    ///     let mut epoll = new_epoll!().unwrap();
+    ///     let mut epoll = &mut epoll;
+    ///     let token = epoll.add_file(&file, Opts::OUT).unwrap();
+    ///     epoll.wait_timeout(Duration::from_millis(10)).unwrap();
+    ///     token
+    /// };
+    /// ```
+    #[doc(hidden)]
+    #[allow(unused)] // this test is actually a doctest
+    fn test_token_lifetime() {}
 
     // Opens a unix pipe and wraps in in Rust `File`s
     //                            read  write
