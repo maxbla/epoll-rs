@@ -15,8 +15,8 @@ name="epoll_rs"
 path="src/lib.rs"
 
 [dependencies]
-libc = {version ="^0.2", features = ["extra_traits"]}
+libc = {version ="^0.2"}
 bitflags = "^1.2.1"
 
 [dev-dependencies]
-rand = {version = "0.8.4", features = []}
+rand = {version = "0.8.4"}
