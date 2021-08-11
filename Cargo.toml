@@ -3,6 +3,12 @@ name = "epoll-rs"
 version = "0.1.0"
 authors = ["Max Blachman <blachmanmax@gmail.com>"]
 edition = "2018"
+description = "High level bindings to linux's epoll interface"
+readme = "README.md"
+repository = "https://github.com/maxbla/epoll-rs"
+license = "MIT OR Apache-2.0"
+keywords = ["linux", "epoll", "filesystem"]
+categories = ["filesystem", "os", "os::linux-apis"]
 
 [lib]
 name="epoll_rs"

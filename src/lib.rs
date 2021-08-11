@@ -6,20 +6,26 @@
 //! epoll::add returns a [`Token`] that takes ownership of the added file.
 //! ```no_run
 //! use epoll_rs::{Epoll, Opts};
-//! let mut epoll = Epoll::new().unwrap();
-//! # let file = std::fs::File::open("").unwrap();
-//! let token = epoll.add(file, Opts::IN).unwrap();
+//! # fn main() -> std::io::Result<()> {
+//! let mut epoll = Epoll::new()?;
+//! # let file = std::fs::File::open("")?;
+//! let token = epoll.add(file, Opts::IN)?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Tokens returned from one epoll instance cannot be used with another instance.
 //! Doing so will cause a panic in debug mode and undefined behavior in release mode.
 //! ```no_run
 //! use epoll_rs::{Epoll, Opts};
-//! let mut epoll1 = Epoll::new().unwrap();
-//! let mut epoll2 = Epoll::new().unwrap();
-//! # let file = std::fs::File::open("").unwrap();
-//! let token1 = epoll1.add(file, Opts::IN).unwrap();
+//! # fn main() -> std::io::Result<()> {
+//! let mut epoll1 = Epoll::new()?;
+//! let mut epoll2 = Epoll::new()?;
+//! # let file = std::fs::File::open("")?;
+//! let token1 = epoll1.add(file, Opts::IN)?;
 //! let res = epoll2.remove(token1); // <- undefined behavior in release mode
+//! # Ok(())
+//! # }
 //! ```
 
 use bitflags::bitflags;
@@ -94,7 +100,7 @@ bitflags! {
     /// Options used in [adding](Epoll::add) a file or
     /// [modifying](Epoll::modify) a previously added file
     ///
-    /// Bitwise or (`|`) these together to control multiple options
+    /// Bitwise or (`|`) these together to combine multiple options
     pub struct Opts: libc::c_uint {
         /// Available for reads
         const IN = libc::EPOLLIN as libc::c_uint;
@@ -223,12 +229,13 @@ impl EpollEvent {
 /// use std::os::unix::io::AsRawFd;
 /// use epoll_rs::{Epoll, Opts, EpollEvent};
 ///
-/// let mut epoll = Epoll::new().unwrap();
-/// let file = File::open("/").unwrap();
-/// let token = epoll.add(file, Opts::IN).unwrap();
+/// # fn main() -> std::io::Result<()> {
+/// let mut epoll = Epoll::new()?;
+/// let file = File::open("/")?;
+/// let token = epoll.add(file, Opts::IN)?;
 /// // add other files...
 /// let mut buf = [EpollEvent::zeroed(); 10];
-/// let events = epoll.wait_timeout(&mut buf, Duration::from_millis(50)).unwrap();
+/// let events = epoll.wait_timeout(&mut buf, Duration::from_millis(50))?;
 /// for event in events {
 ///     if token.fd() == event.fd() {
 ///         println!("File ready for reading");
@@ -237,6 +244,8 @@ impl EpollEvent {
 ///     }
 /// }
 /// epoll.remove(token); // this cleanup is performed when epoll goes out of scope
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug)]
 pub struct Epoll {
@@ -270,7 +279,7 @@ impl Drop for Epoll {
         // Safety: this library mantains as an invariant that self.epoll_fd
         // refers to a valid, open file, but libc::close is safe to call on
         // invalid/closed file descriptors too (it returns -1 and sets errno)
-        unsafe { libc::close(self.epoll_fd) };
+        unsafe {libc::close(self.epoll_fd)};
     }
 }
 
@@ -437,6 +446,20 @@ impl Epoll {
         res.map(|slice| slice.get(0).copied())
     }
 
+    /// Manually close this epoll instance, handling any potential errors
+    ///
+    /// Same as drop, only this lets the user deal with errors in closing.
+    /// The invariants of this library should mean that close never fails, but
+    /// those invariants can be broken with unsafe code.
+    pub fn close(self) -> io::Result<()> {
+        // Safety: this library mantains as an invariant that self.epoll_fd
+        // refers to a valid, open file, but libc::close is safe to call on
+        // invalid/closed file descriptors too (it returns -1 and sets errno)
+        let res = unsafe {libc::close(self.epoll_fd)};
+        then_errno!(res == -1);
+        Ok(())
+    }
+
     /// Adds a RawFd to an epoll instance directly
     ///
     /// This is pretty unsafe, prefer [add](Self::add)
@@ -450,25 +473,31 @@ impl Epoll {
     /// ```rust
     /// use epoll_rs::{Epoll, Opts, Token};
     /// use std::{fs::File, io, os::unix::io::{FromRawFd, AsRawFd}};
-    /// let mut epoll = Epoll::new().unwrap();
+    /// # fn main() -> io::Result<()> {
+    /// let mut epoll = Epoll::new()?;
     /// {
     ///     let stdin = unsafe{File::from_raw_fd(1)};
     ///     let token: Token<File> = unsafe {
-    ///         epoll.add_raw_fd(stdin.as_raw_fd(), Opts::IN).unwrap()
+    ///         epoll.add_raw_fd(stdin.as_raw_fd(), Opts::IN)?
     ///     };
     /// } // stdin dropped here, fd 1 `libc::close`d, invariants violated
+    /// # Ok(())
+    /// # }
     /// ```
     /// instead use into_raw_fd to get an unowned RawFd
     /// ```rust
     /// use epoll_rs::{Epoll, Opts, Token};
     /// use std::{fs::File, io, os::unix::io::{FromRawFd, AsRawFd, IntoRawFd}};
-    /// let mut epoll = Epoll::new().unwrap();
+    /// # fn main() -> io::Result<()> {
+    /// let mut epoll = Epoll::new()?;
     /// {
     ///     let stdin = unsafe{File::from_raw_fd(1)};
     ///     let token: Token<File> = unsafe {
-    ///         epoll.add_raw_fd(stdin.into_raw_fd(), Opts::IN).unwrap()
+    ///         epoll.add_raw_fd(stdin.into_raw_fd(), Opts::IN)?
     ///     };
     /// } // stdin was consumed by into_raw_fd(), so it's drop code won't be run
+    /// # Ok(())
+    /// # }
     /// ```
     pub unsafe fn add_raw_fd<'a, 'b:'a, F: OwnedRawFd>(
         &'b self,
@@ -498,6 +527,7 @@ impl Epoll {
 /// # use std::*;
 /// # use time::*;
 /// # use fs::*;
+/// # fn main() -> std::io::Result<()> {
 /// let file = File::open("").unwrap();
 /// let token = {
 ///     let mut epoll = Epoll::new().unwrap();
@@ -505,6 +535,8 @@ impl Epoll {
 ///     epoll.wait_one_timeout(Duration::from_millis(10)).unwrap();
 ///     token
 /// }; // epoll doesn't live long enough
+/// # Ok(())
+/// # }
 /// ```
 //#[cfg(test)]
 #[doc(hidden)]
