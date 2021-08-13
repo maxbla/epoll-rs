@@ -451,7 +451,7 @@ impl Epoll {
     /// Same as drop, only this lets the user deal with errors in closing.
     /// The invariants of this library should mean that close never fails, but
     /// those invariants can be broken with unsafe code.
-    pub fn close(self) -> io::Result<()> {
+    pub fn close(&mut self) -> io::Result<()> {
         // Safety: this library mantains as an invariant that self.epoll_fd
         // refers to a valid, open file, but libc::close is safe to call on
         // invalid/closed file descriptors too (it returns -1 and sets errno)
