@@ -179,7 +179,7 @@ impl Hash for EpollData {
 
 /// An event, such as that a file is available for reading.
 /// Transmute compatible with `libc::epoll_event`
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct EpollEvent {
     pub events: Opts,
